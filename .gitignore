@@ -1,0 +1,31 @@
+
+# وابستگی‌های Node.js
+node_modules/
+server/node_modules/
+
+# فایل‌های محرمانه
+.env
+.env.*
+!.env.example
+
+# خروجی ساخت برنامه
+dist/
+build/
+
+# فایل‌های موقت و گزارش‌ها
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# فایل‌های اندروید و خروجی APK
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/*.jks
+android/app/*.keystore
+
+# فایل‌های ویرایشگر
+.vscode/
+.idea/
