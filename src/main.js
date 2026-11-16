@@ -1,74 +1,22 @@
 
 import "./style.css";
+import { io } from "socket.io-client";
 
-const SERVER_URL = "http://127.0.0.1:3001";
-
+const SERVER_URL = "https://gapyar-server.onrender.com";
 const app = document.querySelector("#app");
 
+const socket = io(SERVER_URL, {
+  autoConnect: true,
+  reconnection: true,
+  timeout: 20000
+});
+
 const chats = [
-  {
-    id: "amir",
-    name: "امیر",
-    avatar: "👨🏻",
-    color: "purple",
-    time: "۱۲:۴۵",
-    unread: 2,
-    group: false,
-    messages: [
-      { text: "سلام، خوبی؟", mine: false, time: "۱۲:۳۰" },
-      { text: "سلام، ممنونم. تو خوبی؟", mine: true, time: "۱۲:۳۲" },
-      { text: "گپ‌یار آماده شد؟", mine: false, time: "۱۲:۴۵" }
-    ]
-  },
-  {
-    id: "programming",
-    name: "گروه برنامه‌نویسی",
-    avatar: "💻",
-    color: "blue",
-    time: "۱۱:۲۰",
-    unread: 4,
-    group: true,
-    messages: [
-      { text: "سلام به همه اعضا", mine: false, time: "۱۱:۱۰" },
-      { text: "به گروه خوش آمدید!", mine: true, time: "۱۱:۲۰" }
-    ]
-  },
-  {
-    id: "mohammad",
-    name: "محمد",
-    avatar: "🧑🏻",
-    color: "green",
-    time: "دیروز",
-    unread: 0,
-    group: false,
-    messages: [
-      { text: "فردا صحبت می‌کنیم.", mine: false, time: "۱۹:۳۰" }
-    ]
-  },
-  {
-    id: "sara",
-    name: "سارا",
-    avatar: "👩🏻",
-    color: "pink",
-    time: "دیروز",
-    unread: 0,
-    group: false,
-    messages: [
-      { text: "عکس‌ها را دیدی؟", mine: false, time: "۱۸:۱۰" }
-    ]
-  },
-  {
-    id: "friends",
-    name: "گروه دوستان",
-    avatar: "👥",
-    color: "orange",
-    time: "شنبه",
-    unread: 0,
-    group: true,
-    messages: [
-      { text: "کی وقت داره؟", mine: false, time: "۱۶:۰۰" }
-    ]
-  }
+  { id: "amir", name: "امیر", avatar: "👨🏻", color: "purple", group: false, messages: [], unread: 0, time: "" },
+  { id: "programming", name: "گروه برنامه‌نویسی", avatar: "💻", color: "blue", group: true, messages: [], unread: 0, time: "" },
+  { id: "mohammad", name: "محمد", avatar: "🧑🏻", color: "green", group: false, messages: [], unread: 0, time: "" },
+  { id: "sara", name: "سارا", avatar: "👩🏻", color: "pink", group: false, messages: [], unread: 0, time: "" },
+  { id: "friends", name: "گروه دوستان", avatar: "👥", color: "orange", group: true, messages: [], unread: 0, time: "" }
 ];
 
 let selectedChatId = null;
@@ -77,80 +25,89 @@ let activeFilter = "all";
 let searchText = "";
 
 function escapeHTML(value) {
-  return String(value).replace(/[&<>"']/g, (char) => ({
-    "&": "&amp;",
-    "<": "&lt;",
-    ">": "&gt;",
-    '"': "&quot;",
-    "'": "&#039;"
+  return String(value).replace(/[&<>"']/g, char => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;",
+    '"': "&quot;", "'": "&#039;"
   })[char]);
 }
 
 function selectedChat() {
-  return chats.find((chat) => chat.id === selectedChatId);
+  return chats.find(chat => chat.id === selectedChatId);
 }
 
-function getFilteredChats() {
-  return chats.filter((chat) => {
-    const matchesSearch = chat.name
-      .toLowerCase()
-      .includes(searchText.toLowerCase());
-
-    const matchesFilter =
-      activeFilter === "all" ||
-      (activeFilter === "unread" && chat.unread > 0) ||
-      (activeFilter === "groups" && chat.group);
-
-    return matchesSearch && matchesFilter;
+function currentTime() {
+  return new Date().toLocaleTimeString("fa-IR", {
+    hour: "2-digit",
+    minute: "2-digit"
   });
+}
+
+function updateConnectionStatus(online) {
+  const element = document.querySelector("#connection-status");
+  if (!element) return;
+
+  element.classList.toggle("online", online);
+  element.classList.toggle("offline", !online);
+  element.innerHTML = `
+    <span class="status-dot"></span>
+    ${online ? "سرور متصل است" : "سرور قطع است"}
+  `;
+}
+
+function joinSelectedRoom() {
+  const chat = selectedChat();
+  if (chat && socket.connected) {
+    socket.emit("join-room", chat.id);
+  }
 }
 
 function renderChatList() {
   const list = document.querySelector("#chat-list");
   if (!list) return;
 
-  const filtered = getFilteredChats();
+  const filtered = chats.filter(chat => {
+    const search = chat.name.toLowerCase().includes(searchText.toLowerCase());
+    const filter =
+      activeFilter === "all" ||
+      (activeFilter === "unread" && chat.unread > 0) ||
+      (activeFilter === "groups" && chat.group);
 
-  if (filtered.length === 0) {
+    return search && filter;
+  });
+
+  if (!filtered.length) {
     list.innerHTML = `
       <div class="empty-state">
         <div class="empty-icon">🔎</div>
         <h3>گفتگویی پیدا نشد</h3>
-        <p>نام دیگری جستجو کن.</p>
-      </div>
-    `;
+      </div>`;
     return;
   }
 
-  list.innerHTML = filtered.map((chat) => {
-    const lastMessage = chat.messages.at(-1);
+  list.innerHTML = filtered.map(chat => {
+    const last = chat.messages.at(-1);
 
     return `
-      <button class="chat-item" type="button" data-chat-id="${chat.id}">
+      <button class="chat-item" type="button" data-chat-id="${escapeHTML(chat.id)}">
         <div class="avatar ${chat.color}">${chat.avatar}</div>
-
         <div class="chat-info">
           <div class="chat-title-row">
             <strong>${escapeHTML(chat.name)}</strong>
             <span class="chat-time">${escapeHTML(chat.time)}</span>
           </div>
-
           <div class="chat-bottom-row">
             <span class="last-message">
-              ${lastMessage ? escapeHTML(lastMessage.text) : "هنوز پیامی وجود ندارد"}
+              ${last ? escapeHTML(last.text) : "هنوز پیامی وجود ندارد"}
             </span>
-            ${chat.unread > 0
-              ? `<span class="unread-count">${chat.unread}</span>`
-              : ""}
+            ${chat.unread ? `<span class="unread-count">${chat.unread}</span>` : ""}
           </div>
         </div>
-      </button>
-    `;
+      </button>`;
   }).join("");
 }
 
 function renderConversation(chat) {
-  const messages = chat.messages.map((message) => `
+  const messages = chat.messages.map(message => `
     <div class="message-row ${message.mine ? "mine" : "theirs"}">
       <div class="message-bubble">
         <div class="message-text">${escapeHTML(message.text)}</div>
@@ -162,13 +119,12 @@ function renderConversation(chat) {
   return `
     <section class="conversation">
       <header class="conversation-header">
-        <button class="icon-button" type="button" data-action="back">➜</button>
+        <button class="icon-button" data-action="back">➜</button>
         <div class="avatar small ${chat.color}">${chat.avatar}</div>
         <div class="conversation-user">
           <strong>${escapeHTML(chat.name)}</strong>
-          <span>گفتگوی آزمایشی</span>
+          <span>${socket.connected ? "آنلاین" : "در حال اتصال..."}</span>
         </div>
-        <button class="icon-button" type="button" aria-label="گزینه‌ها">⋮</button>
       </header>
 
       <div class="messages" id="messages">
@@ -177,19 +133,12 @@ function renderConversation(chat) {
       </div>
 
       <form class="message-form" id="message-form">
-        <input
-          id="message-input"
-          type="text"
-          maxlength="2000"
-          placeholder="پیامت را بنویس..."
-          autocomplete="off"
-          required
-        />
-        <button class="send-button" type="submit" aria-label="ارسال">➤</button>
+        <input id="message-input" type="text"
+          maxlength="2000" placeholder="پیامت را بنویس..."
+          autocomplete="off" required />
+        <button class="send-button" type="submit">➤</button>
       </form>
-      <p class="demo-note">پیام‌های این صفحه فعلاً فقط در همین نسخه آزمایشی هستند.</p>
-    </section>
-  `;
+    </section>`;
 }
 
 function renderMainPage() {
@@ -198,26 +147,17 @@ function renderMainPage() {
       <header class="top-header">
         <div class="brand">
           <div class="brand-logo">گ</div>
-          <div>
-            <h1>گپ‌یار</h1>
-            <span>با هم در ارتباط باشیم</span>
-          </div>
+          <div><h1>گپ‌یار</h1><span>با هم در ارتباط باشیم</span></div>
         </div>
         <div class="connection-status" id="connection-status">
-          <span class="status-dot"></span>
-          در حال بررسی سرور...
+          <span class="status-dot"></span> در حال اتصال...
         </div>
       </header>
 
       <main class="main-content">
         <div class="section-heading">
-          <div>
-            <h2>گفتگوها</h2>
-            <p>پیام‌های دوستانت اینجا هستند</p>
-          </div>
-          <button class="new-chat-button" type="button" data-action="new-chat">
-            ＋ گفتگوی جدید
-          </button>
+          <div><h2>گفتگوها</h2><p>پیام‌های دوستانت اینجا هستند</p></div>
+          <button class="new-chat-button" data-action="new-chat">＋ گفتگوی جدید</button>
         </div>
 
         <div class="search-box">
@@ -235,21 +175,11 @@ function renderMainPage() {
       </main>
 
       <nav class="bottom-nav">
-        <button class="nav-item ${activeTab === "chats" ? "active" : ""}" data-tab="chats">
-          <span>▤</span>
-          گفتگوها
-        </button>
-        <button class="nav-item ${activeTab === "contacts" ? "active" : ""}" data-tab="contacts">
-          <span>♙</span>
-          مخاطبین
-        </button>
-        <button class="nav-item ${activeTab === "profile" ? "active" : ""}" data-tab="profile">
-          <span>⚙</span>
-          پروفایل
-        </button>
+        <button class="nav-item ${activeTab === "chats" ? "active" : ""}" data-tab="chats"><span>▤</span> گفتگوها</button>
+        <button class="nav-item ${activeTab === "contacts" ? "active" : ""}" data-tab="contacts"><span>♙</span> مخاطبین</button>
+        <button class="nav-item ${activeTab === "profile" ? "active" : ""}" data-tab="profile"><span>⚙</span> پروفایل</button>
       </nav>
-    </div>
-  `;
+    </div>`;
 }
 
 function renderSimplePage(title, description, icon) {
@@ -258,39 +188,24 @@ function renderSimplePage(title, description, icon) {
       <header class="top-header">
         <div class="brand">
           <div class="brand-logo">گ</div>
-          <div>
-            <h1>گپ‌یار</h1>
-            <span>با هم در ارتباط باشیم</span>
-          </div>
+          <div><h1>گپ‌یار</h1><span>با هم در ارتباط باشیم</span></div>
         </div>
         <div class="connection-status" id="connection-status">
-          <span class="status-dot"></span>
-          در حال بررسی سرور...
+          <span class="status-dot"></span> در حال اتصال...
         </div>
       </header>
-
       <main class="simple-page">
         <div class="simple-icon">${icon}</div>
         <h2>${title}</h2>
         <p>${description}</p>
-        <button class="new-chat-button" type="button" data-tab="chats">
-          بازگشت به گفتگوها
-        </button>
+        <button class="new-chat-button" data-tab="chats">بازگشت به گفتگوها</button>
       </main>
-
       <nav class="bottom-nav">
-        <button class="nav-item ${activeTab === "chats" ? "active" : ""}" data-tab="chats">
-          <span>▤</span> گفتگوها
-        </button>
-        <button class="nav-item ${activeTab === "contacts" ? "active" : ""}" data-tab="contacts">
-          <span>♙</span> مخاطبین
-        </button>
-        <button class="nav-item ${activeTab === "profile" ? "active" : ""}" data-tab="profile">
-          <span>⚙</span> پروفایل
-        </button>
+        <button class="nav-item ${activeTab === "chats" ? "active" : ""}" data-tab="chats">▤ گفتگوها</button>
+        <button class="nav-item ${activeTab === "contacts" ? "active" : ""}" data-tab="contacts">♙ مخاطبین</button>
+        <button class="nav-item ${activeTab === "profile" ? "active" : ""}" data-tab="profile">⚙ پروفایل</button>
       </nav>
-    </div>
-  `;
+    </div>`;
 }
 
 function render() {
@@ -309,73 +224,75 @@ function render() {
   }
 
   if (activeTab === "contacts") {
-    app.innerHTML = renderSimplePage(
-      "مخاطبین",
-      "بخش مخاطبین در مراحل بعدی تکمیل می‌شود.",
-      "♙"
-    );
+    app.innerHTML = renderSimplePage("مخاطبین", "بخش مخاطبین بعداً تکمیل می‌شود.", "♙");
+    updateConnectionStatus(socket.connected);
     return;
   }
 
   if (activeTab === "profile") {
-    app.innerHTML = renderSimplePage(
-      "پروفایل",
-      "تنظیمات حساب کاربری در مراحل بعدی اضافه می‌شود.",
-      "⚙"
-    );
+    app.innerHTML = renderSimplePage("پروفایل", "تنظیمات حساب کاربری بعداً اضافه می‌شود.", "⚙");
+    updateConnectionStatus(socket.connected);
     return;
   }
 
   app.innerHTML = renderMainPage();
   renderChatList();
 
-  const searchInput = document.querySelector("#search-input");
-  searchInput.value = searchText;
+  const input = document.querySelector("#search-input");
+  if (input) input.value = searchText;
+
+  updateConnectionStatus(socket.connected);
 }
 
-function updateConnectionStatus(online, message) {
-  const element = document.querySelector("#connection-status");
-  if (!element) return;
+socket.on("connect", () => {
+  updateConnectionStatus(true);
+  joinSelectedRoom();
+});
 
-  element.classList.toggle("online", online);
-  element.classList.toggle("offline", !online);
+socket.on("disconnect", () => {
+  updateConnectionStatus(false);
+});
 
-  element.innerHTML = `
-    <span class="status-dot"></span>
-    ${escapeHTML(message)}
-  `;
-}
+socket.on("connect_error", error => {
+  console.error("Socket error:", error.message);
+  updateConnectionStatus(false);
+});
 
-async function checkGapYarServer() {
-  try {
-    const response = await fetch(`${SERVER_URL}/api/health`, {
-      method: "GET",
-      cache: "no-store"
-    });
+socket.on("new-message", data => {
+  if (!data || typeof data.room !== "string" ||
+      typeof data.message !== "string") return;
 
-    if (!response.ok) {
-      throw new Error("Server response error");
-    }
+  const chat = chats.find(item => item.id === data.room);
+  if (!chat) return;
 
-    const data = await response.json();
+  chat.messages.push({
+    text: data.message,
+    mine: false,
+    time: data.time
+      ? new Date(data.time).toLocaleTimeString("fa-IR", {
+          hour: "2-digit",
+          minute: "2-digit"
+        })
+      : currentTime()
+  });
 
-    if (data.status !== "ok") {
-      throw new Error("Server is not ready");
-    }
+  chat.time = currentTime();
 
-    updateConnectionStatus(true, "سرور متصل است");
-  } catch (error) {
-    updateConnectionStatus(false, "سرور قطع است");
-    console.error("GapYar server:", error);
+  if (selectedChatId === chat.id) {
+    render();
+  } else {
+    chat.unread++;
+    renderChatList();
   }
-}
+});
 
-app.addEventListener("click", (event) => {
+app.addEventListener("click", event => {
   const chatButton = event.target.closest("[data-chat-id]");
 
   if (chatButton) {
     selectedChatId = chatButton.dataset.chatId;
     render();
+    joinSelectedRoom();
     return;
   }
 
@@ -407,18 +324,18 @@ app.addEventListener("click", (event) => {
   }
 
   if (actionButton.dataset.action === "new-chat") {
-    alert("امکان ساخت گفتگوی جدید در مراحل بعدی اضافه می‌شود.");
+    alert("ساخت گفتگوی جدید در مراحل بعدی اضافه می‌شود.");
   }
 });
 
-app.addEventListener("input", (event) => {
+app.addEventListener("input", event => {
   if (event.target.id === "search-input") {
     searchText = event.target.value;
     renderChatList();
   }
 });
 
-app.addEventListener("submit", (event) => {
+app.addEventListener("submit", event => {
   if (event.target.id !== "message-form") return;
 
   event.preventDefault();
@@ -429,23 +346,17 @@ app.addEventListener("submit", (event) => {
 
   if (!chat || !message) return;
 
-  const now = new Date();
-  const time = now.toLocaleTimeString("fa-IR", {
-    hour: "2-digit",
-    minute: "2-digit"
+  if (!socket.connected) {
+    alert("اتصال به سرور برقرار نیست.");
+    return;
+  }
+
+  socket.emit("send-message", {
+    room: chat.id,
+    message
   });
 
-  chat.messages.push({
-    text: message,
-    mine: true,
-    time
-  });
-
-  chat.time = time;
-  render();
+  input.value = "";
 });
 
 render();
-checkGapYarServer();
-
-setInterval(checkGapYarServer, 5000);
