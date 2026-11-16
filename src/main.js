@@ -24,6 +24,10 @@ let activeTab = "chats";
 let activeFilter = "all";
 let searchText = "";
 
+const loadedRooms = new Set();
+const loadingRooms = new Set();
+const receivedMessageIds = new Set();
+
 function escapeHTML(value) {
   return String(value).replace(/[&<>"']/g, char => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;",
@@ -42,6 +46,15 @@ function currentTime() {
   });
 }
 
+function formatTime(value) {
+  if (!value) return currentTime();
+
+  return new Date(value).toLocaleTimeString("fa-IR", {
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
 function updateConnectionStatus(online) {
   const element = document.querySelector("#connection-status");
   if (!element) return;
@@ -54,10 +67,59 @@ function updateConnectionStatus(online) {
   `;
 }
 
+async function loadHistory(chat) {
+  if (!chat || loadedRooms.has(chat.id) || loadingRooms.has(chat.id)) return;
+
+  loadingRooms.add(chat.id);
+
+  try {
+    const response = await fetch(
+      `${SERVER_URL}/api/messages/${encodeURIComponent(chat.id)}`
+    );
+
+    if (!response.ok) {
+      throw new Error("دریافت تاریخچه ناموفق بود");
+    }
+
+    const history = await response.json();
+
+    if (!Array.isArray(history)) {
+      throw new Error("پاسخ سرور نامعتبر است");
+    }
+
+    chat.messages = history.map(item => {
+      if (item.id) receivedMessageIds.add(String(item.id));
+
+      return {
+        id: item.id,
+        text: item.message,
+        mine: false,
+        time: formatTime(item.created_at)
+      };
+    });
+
+    const last = chat.messages.at(-1);
+    if (last) chat.time = last.time;
+
+    loadedRooms.add(chat.id);
+
+    if (selectedChatId === chat.id) render();
+    else renderChatList();
+
+  } catch (error) {
+    console.error("History error:", error);
+    alert("دریافت پیام‌های قبلی انجام نشد. دوباره تلاش کن.");
+  } finally {
+    loadingRooms.delete(chat.id);
+  }
+}
+
 function joinSelectedRoom() {
   const chat = selectedChat();
+
   if (chat && socket.connected) {
     socket.emit("join-room", chat.id);
+    loadHistory(chat);
   }
 }
 
@@ -67,6 +129,7 @@ function renderChatList() {
 
   const filtered = chats.filter(chat => {
     const search = chat.name.toLowerCase().includes(searchText.toLowerCase());
+
     const filter =
       activeFilter === "all" ||
       (activeFilter === "unread" && chat.unread > 0) ||
@@ -128,7 +191,7 @@ function renderConversation(chat) {
       </header>
 
       <div class="messages" id="messages">
-        <div class="date-divider"><span>امروز</span></div>
+        <div class="date-divider"><span>تاریخچه پیام‌ها</span></div>
         ${messages}
       </div>
 
@@ -215,8 +278,10 @@ function render() {
     if (chat) {
       chat.unread = 0;
       app.innerHTML = renderConversation(chat);
+
       const messages = document.querySelector("#messages");
       if (messages) messages.scrollTop = messages.scrollHeight;
+
       return;
     }
 
@@ -259,21 +324,23 @@ socket.on("connect_error", error => {
 });
 
 socket.on("new-message", data => {
-  if (!data || typeof data.room !== "string" ||
-      typeof data.message !== "string") return;
+  if (
+    !data ||
+    typeof data.room !== "string" ||
+    typeof data.message !== "string"
+  ) return;
 
   const chat = chats.find(item => item.id === data.room);
   if (!chat) return;
 
+  if (data.id && receivedMessageIds.has(String(data.id))) return;
+  if (data.id) receivedMessageIds.add(String(data.id));
+
   chat.messages.push({
+    id: data.id,
     text: data.message,
     mine: false,
-    time: data.time
-      ? new Date(data.time).toLocaleTimeString("fa-IR", {
-          hour: "2-digit",
-          minute: "2-digit"
-        })
-      : currentTime()
+    time: formatTime(data.created_at || data.time)
   });
 
   chat.time = currentTime();
