@@ -18,7 +18,7 @@ const pool = new Pool({
 });
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "100kb" }));
 
 const io = new Server(httpServer, {
   cors: {
@@ -26,6 +26,10 @@ const io = new Server(httpServer, {
     methods: ["GET", "POST"]
   }
 });
+
+// --------------------
+// Database
+// --------------------
 
 async function initializeDatabase() {
   await pool.query(`
@@ -38,19 +42,27 @@ async function initializeDatabase() {
   `);
 }
 
+// --------------------
+// Main API
+// --------------------
+
 app.get("/", (req, res) => {
   res.json({
     app: "GapYar",
     status: "online",
     message: "سرور گپ‌یار فعال است",
-    version: "1.1.0"
+    version: "1.2.0"
   });
 });
 
 app.get("/api/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
-    res.json({ status: "ok", database: "connected" });
+
+    res.json({
+      status: "ok",
+      database: "connected"
+    });
   } catch {
     res.status(503).json({
       status: "error",
@@ -59,11 +71,17 @@ app.get("/api/health", async (req, res) => {
   }
 });
 
+// --------------------
+// Chat history
+// --------------------
+
 app.get("/api/messages/:room", async (req, res) => {
   const room = req.params.room;
 
   if (!/^[a-z0-9_-]{1,100}$/i.test(room)) {
-    return res.status(400).json({ error: "اتاق نامعتبر است" });
+    return res.status(400).json({
+      error: "اتاق نامعتبر است"
+    });
   }
 
   try {
@@ -77,10 +95,18 @@ app.get("/api/messages/:room", async (req, res) => {
     );
 
     res.json(result.rows);
-  } catch {
-    res.status(500).json({ error: "خطا در دریافت پیام‌ها" });
+  } catch (error) {
+    console.error("History error:", error.message);
+
+    res.status(500).json({
+      error: "خطا در دریافت پیام‌ها"
+    });
   }
 });
+
+// --------------------
+// Socket.IO
+// --------------------
 
 io.on("connection", socket => {
   console.log("کاربر متصل شد:", socket.id);
@@ -102,7 +128,9 @@ io.on("connection", socket => {
       typeof data.message !== "string" ||
       !data.message.trim() ||
       data.message.length > 2000
-    ) return;
+    ) {
+      return;
+    }
 
     try {
       const result = await pool.query(
@@ -114,7 +142,8 @@ io.on("connection", socket => {
 
       io.to(data.room).emit("new-message", result.rows[0]);
     } catch (error) {
-      console.error("خطای ذخیره پیام:", error.message);
+      console.error("Message save error:", error.message);
+
       socket.emit("message-error", {
         message: "ذخیره پیام انجام نشد"
       });
@@ -125,6 +154,70 @@ io.on("connection", socket => {
     console.log("کاربر قطع شد:", socket.id);
   });
 });
+
+// --------------------
+// Rubika Webhook
+// --------------------
+
+app.post("/rubika/webhook/:secret", async (req, res) => {
+  const secret = process.env.RUBIKA_WEBHOOK_SECRET;
+  const token = process.env.RUBIKA_BOT_TOKEN;
+
+  if (!secret || !token || req.params.secret !== secret) {
+    return res.sendStatus(404);
+  }
+
+  const update = req.body?.update;
+  const message = update?.new_message;
+
+  if (
+    update?.type !== "NewMessage" ||
+    message?.sender_type !== "User" ||
+    typeof update.chat_id !== "string"
+  ) {
+    return res.sendStatus(200);
+  }
+
+  const text = typeof message.text === "string"
+    ? message.text.trim()
+    : "";
+
+  if (text !== "/start") {
+    return res.sendStatus(200);
+  }
+
+  try {
+    const response = await fetch(
+      `https://botapi.rubika.ir/v3/${token}/sendMessage`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          chat_id: update.chat_id,
+          text: "سلام! به ربات گپ‌یار خوش آمدی. 🤖\nربات با موفقیت فعال شد."
+        })
+      }
+    );
+
+    const result = await response.json();
+
+    if (!response.ok || result.status !== "OK") {
+      console.error("Rubika API request failed");
+      return res.sendStatus(502);
+    }
+
+    return res.sendStatus(200);
+  } catch (error) {
+    console.error("Rubika webhook error:", error.message);
+    return res.sendStatus(500);
+  }
+});
+
+// --------------------
+// Start server
+// --------------------
 
 const PORT = process.env.PORT || 3000;
 
