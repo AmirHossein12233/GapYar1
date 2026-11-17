@@ -1,21 +1,29 @@
 
 import express from "express";
 import cors from "cors";
-import { createServer } from "node:http";
+import dotenv from "dotenv";
+import http from "http";
 import { Server } from "socket.io";
 import pg from "pg";
 import bcrypt from "bcryptjs";
-import { rateLimit } from "express-rate-limit";
-import { randomBytes, createHash } from "node:crypto";
+import rateLimit from "express-rate-limit";
+import crypto from "crypto";
+
+dotenv.config();
 
 const { Pool } = pg;
-
 const app = express();
-const httpServer = createServer(app);
+const server = http.createServer(app);
 
-app.set("trust proxy", 1);
-app.use(cors());
-app.use(express.json({ limit: "100kb" }));
+const PORT = process.env.PORT || 3000;
+const CLIENT_URL = process.env.CLIENT_URL || "*";
+
+app.use(cors({
+  origin: CLIENT_URL === "*" ? true : CLIENT_URL,
+  credentials: true
+}));
+
+app.use(express.json({ limit: "2mb" }));
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -24,171 +32,188 @@ const pool = new Pool({
     : false
 });
 
-const io = new Server(httpServer, {
+const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: CLIENT_URL === "*" ? true : CLIENT_URL,
     methods: ["GET", "POST"]
   }
 });
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 10,
+  limit: 30,
   standardHeaders: true,
-  legacyHeaders: false,
-  message: {
-    error: "تعداد تلاش‌ها زیاد است. کمی بعد دوباره امتحان کن."
-  }
+  legacyHeaders: false
 });
 
-function hashToken(token) {
-  return createHash("sha256").update(token).digest("hex");
-}
+const hashToken = (token) =>
+  crypto.createHash("sha256").update(token).digest("hex");
 
-function normalizeUsername(value) {
-  return typeof value === "string"
-    ? value.trim().toLowerCase()
-    : "";
+function createToken() {
+  return crypto.randomBytes(32).toString("hex");
 }
 
 async function initializeDatabase() {
   await pool.query(`
-    CREATE TABLE IF NOT EXISTS messages (
-      id BIGSERIAL PRIMARY KEY,
-      room VARCHAR(100) NOT NULL,
-      message TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  await pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id BIGSERIAL PRIMARY KEY,
-      username VARCHAR(20) NOT NULL UNIQUE,
+      username VARCHAR(20) UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS user_sessions (
       id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-      token_hash CHAR(64) NOT NULL UNIQUE,
+      user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+      token_hash TEXT UNIQUE NOT NULL,
       expires_at TIMESTAMPTZ NOT NULL,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversations (
+      id VARCHAR(100) PRIMARY KEY,
+      title VARCHAR(100) NOT NULL,
+      is_group BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS conversation_members (
+      conversation_id VARCHAR(100)
+        REFERENCES conversations(id) ON DELETE CASCADE,
+      user_id BIGINT
+        REFERENCES users(id) ON DELETE CASCADE,
+      joined_at TIMESTAMPTZ DEFAULT NOW(),
+      PRIMARY KEY (conversation_id, user_id)
+    )
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS messages (
+      id BIGSERIAL PRIMARY KEY,
+      room VARCHAR(100) NOT NULL,
+      user_id BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      username VARCHAR(20),
+      message TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `);
+
+  // سازگاری با جدول پیام‌های نسخه قدیمی
+  await pool.query(`
+    ALTER TABLE messages
+      ADD COLUMN IF NOT EXISTS user_id BIGINT
+        REFERENCES users(id) ON DELETE SET NULL,
+      ADD COLUMN IF NOT EXISTS username VARCHAR(20)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS messages_room_id_idx
+    ON messages(room, id)
+  `);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS conversation_members_user_idx
+    ON conversation_members(user_id)
+  `);
+
+  console.log("Database initialized");
 }
 
-// ساخت نشست ورود
 async function createSession(userId) {
-  const token = randomBytes(32).toString("hex");
-  const tokenHash = hashToken(token);
+  const token = createToken();
 
   await pool.query(
     `INSERT INTO user_sessions (user_id, token_hash, expires_at)
      VALUES ($1, $2, NOW() + INTERVAL '30 days')`,
-    [userId, tokenHash]
+    [userId, hashToken(token)]
   );
 
   return token;
 }
 
-// بررسی اعتبار نشست
+async function findUserByToken(token) {
+  if (!token || typeof token !== "string") return null;
+
+  const result = await pool.query(
+    `SELECT users.id, users.username
+     FROM user_sessions
+     JOIN users ON users.id = user_sessions.user_id
+     WHERE user_sessions.token_hash = $1
+       AND user_sessions.expires_at > NOW()`,
+    [hashToken(token)]
+  );
+
+  return result.rows[0] || null;
+}
+
 async function requireAuth(req, res, next) {
-  const header = req.headers.authorization || "";
-  const token = header.startsWith("Bearer ")
-    ? header.slice(7).trim()
-    : "";
-
-  if (!/^[a-f0-9]{64}$/i.test(token)) {
-    return res.status(401).json({
-      error: "ابتدا وارد حساب خود شو"
-    });
-  }
-
   try {
-    const result = await pool.query(
-      `SELECT u.id, u.username
-       FROM user_sessions s
-       JOIN users u ON u.id = s.user_id
-       WHERE s.token_hash = $1
-       AND s.expires_at > NOW()
-       LIMIT 1`,
-      [hashToken(token)]
-    );
+    const header = req.headers.authorization || "";
+    const token = header.startsWith("Bearer ")
+      ? header.slice(7)
+      : "";
 
-    if (!result.rows.length) {
+    const user = await findUserByToken(token);
+
+    if (!user) {
       return res.status(401).json({
-        error: "نشست منقضی شده است. دوباره وارد شو."
+        error: "لطفاً دوباره وارد حساب شوید"
       });
     }
 
-    req.user = result.rows[0];
+    req.user = user;
     req.token = token;
     next();
   } catch (error) {
-    console.error("Authentication error:", error.message);
-    res.status(500).json({
-      error: "خطای سرور در بررسی ورود"
-    });
+    console.error("Auth error:", error);
+    res.status(500).json({ error: "خطای سرور" });
   }
 }
 
-// --------------------
-// Main API
-// --------------------
+async function isMember(conversationId, userId) {
+  const result = await pool.query(
+    `SELECT 1 FROM conversation_members
+     WHERE conversation_id = $1 AND user_id = $2`,
+    [conversationId, userId]
+  );
 
+  return result.rowCount > 0;
+}
+
+// صفحه اصلی
 app.get("/", (req, res) => {
   res.json({
     app: "GapYar",
     status: "online",
     message: "سرور گپ‌یار فعال است",
-    version: "1.3.0"
+    version: "2.0.0"
   });
 });
 
-app.get("/api/health", async (req, res) => {
-  try {
-    await pool.query("SELECT 1");
-    res.json({
-      status: "ok",
-      database: "connected"
-    });
-  } catch {
-    res.status(503).json({
-      status: "error",
-      database: "disconnected"
-    });
-  }
-});
-
-// --------------------
-// Register
-// --------------------
-
+// ثبت نام
 app.post("/api/auth/register", authLimiter, async (req, res) => {
-  const username = normalizeUsername(req.body?.username);
-  const password = req.body?.password;
-
-  if (!/^[a-z0-9_]{3,20}$/.test(username)) {
-    return res.status(400).json({
-      error: "نام کاربری باید ۳ تا ۲۰ حرف انگلیسی، عدد یا زیرخط باشد."
-    });
-  }
-
-  if (
-    typeof password !== "string" ||
-    password.length < 8 ||
-    Buffer.byteLength(password, "utf8") > 72
-  ) {
-    return res.status(400).json({
-      error: "رمز عبور باید حداقل ۸ کاراکتر و حداکثر ۷۲ بایت باشد."
-    });
-  }
-
   try {
+    const username = String(req.body.username || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
+
+    if (!/^[a-z0-9_]{3,20}$/.test(username)) {
+      return res.status(400).json({
+        error: "نام کاربری باید ۳ تا ۲۰ حرف انگلیسی، عدد یا زیرخط باشد"
+      });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({
+        error: "رمز عبور باید حداقل ۸ کاراکتر باشد"
+      });
+    }
+
     const passwordHash = await bcrypt.hash(password, 12);
 
     const result = await pool.query(
@@ -201,274 +226,317 @@ app.post("/api/auth/register", authLimiter, async (req, res) => {
     const user = result.rows[0];
     const token = await createSession(user.id);
 
-    res.status(201).json({
-      message: "ثبت‌نام موفق بود",
-      token,
-      user
-    });
+    res.status(201).json({ user, token });
   } catch (error) {
     if (error.code === "23505") {
       return res.status(409).json({
-        error: "این نام کاربری قبلاً ثبت شده است."
+        error: "این نام کاربری قبلاً ثبت شده است"
       });
     }
 
-    console.error("Register error:", error.message);
-    res.status(500).json({
-      error: "ثبت‌نام انجام نشد"
-    });
+    console.error("Register error:", error);
+    res.status(500).json({ error: "ثبت نام انجام نشد" });
   }
 });
 
-// --------------------
-// Login
-// --------------------
-
+// ورود
 app.post("/api/auth/login", authLimiter, async (req, res) => {
-  const username = normalizeUsername(req.body?.username);
-  const password = req.body?.password;
-
-  if (
-    !/^[a-z0-9_]{3,20}$/.test(username) ||
-    typeof password !== "string" ||
-    Buffer.byteLength(password, "utf8") > 72
-  ) {
-    return res.status(400).json({
-      error: "نام کاربری یا رمز عبور نامعتبر است."
-    });
-  }
-
   try {
+    const username = String(req.body.username || "").trim().toLowerCase();
+    const password = String(req.body.password || "");
+
     const result = await pool.query(
       `SELECT id, username, password_hash
-       FROM users
-       WHERE username = $1
-       LIMIT 1`,
+       FROM users WHERE username = $1`,
       [username]
     );
 
-    if (!result.rows.length) {
-      return res.status(401).json({
-        error: "نام کاربری یا رمز عبور اشتباه است."
-      });
-    }
-
     const user = result.rows[0];
-    const valid = await bcrypt.compare(
-      password,
-      user.password_hash
-    );
 
-    if (!valid) {
+    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
       return res.status(401).json({
-        error: "نام کاربری یا رمز عبور اشتباه است."
+        error: "نام کاربری یا رمز عبور اشتباه است"
       });
     }
 
     const token = await createSession(user.id);
 
     res.json({
-      message: "ورود موفق بود",
-      token,
-      user: {
-        id: user.id,
-        username: user.username
+      user: { id: user.id, username: user.username },
+      token
+    });
+  } catch (error) {
+    console.error("Login error:", error);
+    res.status(500).json({ error: "ورود انجام نشد" });
+  }
+});
+
+// بررسی نشست
+app.get("/api/auth/me", requireAuth, (req, res) => {
+  res.json({ user: req.user });
+});
+
+// خروج
+app.post("/api/auth/logout", requireAuth, async (req, res) => {
+  await pool.query(
+    "DELETE FROM user_sessions WHERE token_hash = $1",
+    [hashToken(req.token)]
+  );
+
+  res.json({ success: true });
+});
+
+// جستجوی کاربران
+app.get("/api/users/search", requireAuth, async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim().toLowerCase();
+
+    if (q.length < 3) {
+      return res.json({ users: [] });
+    }
+
+    const result = await pool.query(
+      `SELECT id, username FROM users
+       WHERE username ILIKE $1 AND id <> $2
+       ORDER BY username
+       LIMIT 20`,
+      [`%${q}%`, req.user.id]
+    );
+
+    res.json({ users: result.rows });
+  } catch (error) {
+    console.error("User search error:", error);
+    res.status(500).json({ error: "جستجو انجام نشد" });
+  }
+});
+
+// ساخت گفتگو
+app.post("/api/conversations", requireAuth, async (req, res) => {
+  const client = await pool.connect();
+
+  try {
+    const title = String(req.body.title || "گفتگوی جدید").trim();
+    const isGroup = Boolean(req.body.isGroup);
+
+    if (!title || title.length > 100) {
+      return res.status(400).json({ error: "عنوان گفتگو نامعتبر است" });
+    }
+
+    const id = crypto.randomBytes(16).toString("hex");
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `INSERT INTO conversations (id, title, is_group)
+       VALUES ($1, $2, $3)`,
+      [id, title, isGroup]
+    );
+
+    await client.query(
+      `INSERT INTO conversation_members (conversation_id, user_id)
+       VALUES ($1, $2)`,
+      [id, req.user.id]
+    );
+
+    await client.query("COMMIT");
+
+    res.status(201).json({
+      conversation: {
+        id,
+        title,
+        is_group: isGroup
       }
     });
   } catch (error) {
-    console.error("Login error:", error.message);
-    res.status(500).json({
-      error: "ورود انجام نشد"
-    });
+    await client.query("ROLLBACK");
+    console.error("Create conversation error:", error);
+    res.status(500).json({ error: "ساخت گفتگو انجام نشد" });
+  } finally {
+    client.release();
   }
 });
 
-// --------------------
-// Current user
-// --------------------
-
-app.get("/api/auth/me", requireAuth, (req, res) => {
-  res.json({
-    user: req.user
-  });
-});
-
-// --------------------
-// Logout
-// --------------------
-
-app.post("/api/auth/logout", requireAuth, async (req, res) => {
-  try {
-    await pool.query(
-      "DELETE FROM user_sessions WHERE token_hash = $1",
-      [hashToken(req.token)]
-    );
-
-    res.json({
-      message: "با موفقیت خارج شدی"
-    });
-  } catch (error) {
-    console.error("Logout error:", error.message);
-    res.status(500).json({
-      error: "خروج انجام نشد"
-    });
-  }
-});
-
-// --------------------
-// Chat history
-// --------------------
-
-app.get("/api/messages/:room", async (req, res) => {
-  const room = req.params.room;
-
-  if (!/^[a-z0-9_-]{1,100}$/i.test(room)) {
-    return res.status(400).json({
-      error: "اتاق نامعتبر است"
-    });
-  }
-
+// دریافت گفتگوها
+app.get("/api/conversations", requireAuth, async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, room, message, created_at
+      `SELECT c.id, c.title, c.is_group, c.created_at
+       FROM conversations c
+       JOIN conversation_members m ON m.conversation_id = c.id
+       WHERE m.user_id = $1
+       ORDER BY c.created_at DESC`,
+      [req.user.id]
+    );
+
+    res.json({ conversations: result.rows });
+  } catch (error) {
+    console.error("Conversations error:", error);
+    res.status(500).json({ error: "دریافت گفتگوها انجام نشد" });
+  }
+});
+
+// افزودن عضو به گفتگو
+app.post("/api/conversations/:id/members", requireAuth, async (req, res) => {
+  try {
+    const conversationId = req.params.id;
+    const username = String(req.body.username || "").trim().toLowerCase();
+
+    if (!(await isMember(conversationId, req.user.id))) {
+      return res.status(403).json({ error: "شما عضو این گفتگو نیستید" });
+    }
+
+    const userResult = await pool.query(
+      "SELECT id, username FROM users WHERE username = $1",
+      [username]
+    );
+
+    const target = userResult.rows[0];
+
+    if (!target) {
+      return res.status(404).json({ error: "کاربر پیدا نشد" });
+    }
+
+    await pool.query(
+      `INSERT INTO conversation_members (conversation_id, user_id)
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING`,
+      [conversationId, target.id]
+    );
+
+    res.json({ success: true, user: target });
+  } catch (error) {
+    console.error("Add member error:", error);
+    res.status(500).json({ error: "افزودن عضو انجام نشد" });
+  }
+});
+
+// تاریخچه پیام‌ها
+app.get("/api/messages/:room", requireAuth, async (req, res) => {
+  try {
+    const room = req.params.room;
+
+    if (!(await isMember(room, req.user.id))) {
+      return res.status(403).json({
+        error: "شما عضو این گفتگو نیستید"
+      });
+    }
+
+    const result = await pool.query(
+      `SELECT id, room, user_id, username, message, created_at
        FROM messages
        WHERE room = $1
        ORDER BY id ASC
-       LIMIT 100`,
+       LIMIT 200`,
       [room]
     );
 
-    res.json(result.rows);
+    res.json({ messages: result.rows });
   } catch (error) {
-    console.error("History error:", error.message);
-    res.status(500).json({
-      error: "خطا در دریافت پیام‌ها"
-    });
+    console.error("History error:", error);
+    res.status(500).json({ error: "دریافت پیام‌ها انجام نشد" });
   }
 });
 
-// --------------------
-// Socket.IO
-// --------------------
+// احراز هویت سوکت
+io.use(async (socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    const user = await findUserByToken(token);
 
-io.on("connection", socket => {
-  console.log("کاربر متصل شد:", socket.id);
+    if (!user) {
+      return next(new Error("UNAUTHORIZED"));
+    }
 
-  socket.on("join-room", room => {
-    if (
-      typeof room === "string" &&
-      /^[a-z0-9_-]{1,100}$/i.test(room)
-    ) {
+    socket.user = user;
+    next();
+  } catch (error) {
+    next(new Error("AUTH_ERROR"));
+  }
+});
+
+// اتصال کاربران
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.user.username);
+
+  socket.on("join-room", async (room) => {
+    try {
+      if (typeof room !== "string") return;
+
+      if (!(await isMember(room, socket.user.id))) {
+        socket.emit("message-error", {
+          error: "شما عضو این گفتگو نیستید"
+        });
+        return;
+      }
+
       socket.join(room);
+      socket.emit("joined-room", { room });
+    } catch (error) {
+      console.error("Join room error:", error);
     }
   });
 
-  socket.on("send-message", async data => {
-    if (
-      !data ||
-      typeof data.room !== "string" ||
-      !/^[a-z0-9_-]{1,100}$/i.test(data.room) ||
-      typeof data.message !== "string" ||
-      !data.message.trim() ||
-      data.message.length > 2000
-    ) {
-      return;
+  socket.on("leave-room", (room) => {
+    if (typeof room === "string") {
+      socket.leave(room);
     }
+  });
 
+  socket.on("send-message", async (data) => {
     try {
+      const room = String(data?.room || "");
+      const message = String(data?.message || "").trim();
+
+      if (!room || !message || message.length > 5000) {
+        return socket.emit("message-error", {
+          error: "متن پیام نامعتبر است"
+        });
+      }
+
+      if (!(await isMember(room, socket.user.id))) {
+        return socket.emit("message-error", {
+          error: "شما عضو این گفتگو نیستید"
+        });
+      }
+
       const result = await pool.query(
-        `INSERT INTO messages (room, message)
-         VALUES ($1, $2)
-         RETURNING id, room, message, created_at`,
-        [data.room, data.message.trim()]
+        `INSERT INTO messages (room, user_id, username, message)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, room, user_id, username, message, created_at`,
+        [room, socket.user.id, socket.user.username, message]
       );
 
-      io.to(data.room).emit("new-message", result.rows[0]);
+      io.to(room).emit("new-message", result.rows[0]);
     } catch (error) {
-      console.error("Message save error:", error.message);
+      console.error("Send message error:", error);
       socket.emit("message-error", {
-        message: "ذخیره پیام انجام نشد"
+        error: "ارسال پیام انجام نشد"
       });
     }
   });
 
   socket.on("disconnect", () => {
-    console.log("کاربر قطع شد:", socket.id);
+    console.log("User disconnected:", socket.user.username);
   });
 });
 
-// --------------------
-// Old Rubika Webhook
-// --------------------
-
-app.post("/rubika/webhook/:secret", async (req, res) => {
-  const secret = process.env.RUBIKA_WEBHOOK_SECRET;
-  const token = process.env.RUBIKA_BOT_TOKEN;
-
-  if (!secret || !token || req.params.secret !== secret) {
-    return res.sendStatus(404);
-  }
-
-  const update = req.body?.update;
-  const message = update?.new_message;
-
-  if (
-    update?.type !== "NewMessage" ||
-    message?.sender_type !== "User" ||
-    typeof update.chat_id !== "string"
-  ) {
-    return res.sendStatus(200);
-  }
-
-  const text = typeof message.text === "string"
-    ? message.text.trim()
-    : "";
-
-  if (text !== "/start") {
-    return res.sendStatus(200);
-  }
-
-  try {
-    const response = await fetch(
-      `https://botapi.rubika.ir/v3/${token}/sendMessage`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          chat_id: update.chat_id,
-          text: "سلام! به ربات گپ‌یار خوش آمدی. 🤖"
-        })
-      }
-    );
-
-    const result = await response.json();
-
-    if (!response.ok || result.status !== "OK") {
-      return res.sendStatus(502);
-    }
-
-    return res.sendStatus(200);
-  } catch (error) {
-    console.error("Rubika webhook error:", error.message);
-    return res.sendStatus(500);
-  }
+// خطاهای عمومی
+app.use((err, req, res, next) => {
+  console.error("Server error:", err);
+  res.status(500).json({ error: "خطای داخلی سرور" });
 });
 
-// --------------------
-// Start server
-// --------------------
+async function start() {
+  try {
+    await initializeDatabase();
 
-const PORT = process.env.PORT || 3000;
-
-initializeDatabase()
-  .then(() => {
-    httpServer.listen(PORT, "0.0.0.0", () => {
+    server.listen(PORT, "0.0.0.0", () => {
       console.log(`GapYar Server running on port ${PORT}`);
     });
-  })
-  .catch(error => {
-    console.error("Database initialization failed:", error);
+  } catch (error) {
+    console.error("Server startup failed:", error);
     process.exit(1);
-  });
+  }
+}
+
+start();
