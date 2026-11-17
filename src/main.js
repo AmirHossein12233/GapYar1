@@ -6,31 +6,31 @@ const SERVER_URL = "https://gapyar-server.onrender.com";
 const TOKEN_KEY = "gapyar_token";
 
 const app = document.querySelector("#app");
+
 let token = localStorage.getItem(TOKEN_KEY);
 let currentUser = null;
 let authMode = "login";
 let authMessage = "";
 let authLoading = false;
 
+let chats = [];
 let selectedChatId = null;
 let activeTab = "chats";
 let activeFilter = "all";
 let searchText = "";
 let socket = null;
-
-const chats = [
-  { id: "amir", name: "امیر", avatar: "👨🏻", color: "purple", time: "۱۲:۴۵", unread: 2, group: false, messages: [] },
-  { id: "programming", name: "گروه برنامه‌نویسی", avatar: "💻", color: "blue", time: "دیروز", unread: 0, group: true, messages: [] },
-  { id: "mohammad", name: "محمد", avatar: "🧑🏻", color: "green", time: "دیروز", unread: 0, group: false, messages: [] },
-  { id: "sara", name: "سارا", avatar: "👩🏻", color: "pink", time: "دوشنبه", unread: 0, group: false, messages: [] },
-  { id: "friends", name: "گروه دوستان", avatar: "👥", color: "orange", time: "یکشنبه", unread: 0, group: true, messages: [] }
-];
+let lastRoomId = null;
+let busy = false;
 
 const seenMessages = new Set();
 
 function escapeHTML(value = "") {
   return String(value).replace(/[&<>"']/g, char => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;"
   })[char]);
 }
 
@@ -43,6 +43,34 @@ function getTime(value = new Date()) {
 
 function selectedChat() {
   return chats.find(chat => chat.id === selectedChatId);
+}
+
+async function api(path, options = {}) {
+  const response = await fetch(`${SERVER_URL}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      ...(options.headers || {})
+    }
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (response.status === 401) {
+    token = null;
+    currentUser = null;
+    localStorage.removeItem(TOKEN_KEY);
+    if (socket) socket.disconnect();
+    showAuth();
+    throw new Error("نشست شما منقضی شده است. دوباره وارد شوید.");
+  }
+
+  if (!response.ok) {
+    throw new Error(data.error || data.message || "خطایی رخ داد.");
+  }
+
+  return data;
 }
 
 function showAuth() {
@@ -96,7 +124,7 @@ async function authRequest(endpoint, username, password) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(data.message || data.error || "اطلاعات واردشده درست نیست.");
+    throw new Error(data.error || data.message || "اطلاعات واردشده درست نیست.");
   }
 
   return data;
@@ -105,8 +133,8 @@ async function authRequest(endpoint, username, password) {
 async function handleAuthSubmit(form) {
   if (authLoading) return;
 
-  const username = form.username.value.trim().toLowerCase();
-  const password = form.password.value;
+  const username = form.elements.username.value.trim().toLowerCase();
+  const password = form.elements.password.value;
 
   authLoading = true;
   authMessage = "";
@@ -124,12 +152,12 @@ async function handleAuthSubmit(form) {
     token = result.token;
     localStorage.setItem(TOKEN_KEY, token);
     currentUser = result.user || { username };
-    authMessage = "";
     authLoading = false;
-    startApp();
+
+    await startApp();
   } catch (error) {
     authLoading = false;
-    authMessage = error.message || "ارتباط با سرور برقرار نشد.";
+    authMessage = error.message;
     showAuth();
   }
 }
@@ -138,14 +166,8 @@ async function checkSession() {
   if (!token) return false;
 
   try {
-    const response = await fetch(`${SERVER_URL}/api/auth/me`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-
-    if (!response.ok) throw new Error("نشست نامعتبر است");
-
-    const data = await response.json();
-    currentUser = data.user || data;
+    const data = await api("/api/auth/me");
+    currentUser = data.user;
     return true;
   } catch {
     token = null;
@@ -157,18 +179,22 @@ async function checkSession() {
 
 async function logout() {
   try {
-    await fetch(`${SERVER_URL}/api/auth/logout`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    await api("/api/auth/logout", { method: "POST" });
   } catch {
-    // خروج محلی حتی در صورت قطع بودن سرور انجام می‌شود.
+    // خروج محلی
   }
 
   token = null;
   currentUser = null;
-  localStorage.removeItem(TOKEN_KEY);
+  chats = [];
   selectedChatId = null;
+  localStorage.removeItem(TOKEN_KEY);
+
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
+
   showAuth();
 }
 
@@ -180,27 +206,55 @@ function updateConnectionStatus(online) {
   status.innerHTML = `<span class="status-dot"></span>${online ? "متصل" : "قطع اتصال"}`;
 }
 
+async function loadConversations() {
+  const data = await api("/api/conversations");
+
+  chats = (data.conversations || []).map(item => ({
+    id: item.id,
+    name: item.title,
+    avatar: item.is_group ? "👥" : "👤",
+    color: item.is_group ? "blue" : "purple",
+    time: item.created_at ? getTime(item.created_at) : "",
+    unread: 0,
+    group: Boolean(item.is_group),
+    messages: []
+  }));
+
+  if (selectedChatId && !chats.some(chat => chat.id === selectedChatId)) {
+    selectedChatId = null;
+  }
+
+  render();
+}
+
 async function loadHistory(chat) {
   try {
-    const response = await fetch(`${SERVER_URL}/api/messages/${encodeURIComponent(chat.id)}`);
-    if (!response.ok) return;
+    const data = await api(
+      `/api/messages/${encodeURIComponent(chat.id)}`
+    );
 
-    const data = await response.json();
-    const messages = Array.isArray(data) ? data : (data.messages || []);
+    const messages = data.messages || [];
 
     messages.forEach(item => {
-      const id = item.id ?? `${chat.id}-${item.created_at}-${item.message}`;
-      if (seenMessages.has(String(id))) return;
-      seenMessages.add(String(id));
+      const id = String(item.id);
+      if (seenMessages.has(id)) return;
+
+      seenMessages.add(id);
 
       chat.messages.push({
-        text: item.message || item.text || "",
+        id,
+        text: item.message || "",
+        username: item.username || "",
         mine: item.username === currentUser?.username,
         time: item.created_at ? getTime(item.created_at) : getTime()
       });
     });
 
-    render();
+    chat.messages.sort((a, b) => {
+      return Number(a.id || 0) - Number(b.id || 0);
+    });
+
+    if (selectedChatId === chat.id) render();
   } catch (error) {
     console.error("History error:", error);
   }
@@ -208,8 +262,14 @@ async function loadHistory(chat) {
 
 function joinSelectedRoom() {
   const chat = selectedChat();
+
   if (!chat || !socket?.connected) return;
 
+  if (lastRoomId && lastRoomId !== chat.id) {
+    socket.emit("leave-room", lastRoomId);
+  }
+
+  lastRoomId = chat.id;
   socket.emit("join-room", chat.id);
   loadHistory(chat);
 }
@@ -217,7 +277,10 @@ function joinSelectedRoom() {
 function connectSocket() {
   if (socket) socket.disconnect();
 
+  lastRoomId = null;
+
   socket = io(SERVER_URL, {
+    auth: { token },
     autoConnect: true,
     reconnection: true,
     reconnectionAttempts: 10,
@@ -229,46 +292,77 @@ function connectSocket() {
     joinSelectedRoom();
   });
 
-  socket.on("disconnect", () => updateConnectionStatus(false));
-  socket.on("connect_error", () => updateConnectionStatus(false));
+  socket.on("disconnect", () => {
+    updateConnectionStatus(false);
+  });
+
+  socket.on("connect_error", error => {
+    updateConnectionStatus(false);
+
+    if (error.message === "UNAUTHORIZED") {
+      logout();
+    }
+  });
+
+  socket.on("message-error", data => {
+    alert(data?.error || "ارسال پیام انجام نشد.");
+  });
 
   socket.on("new-message", data => {
-    const room = data.room || data.chatId;
+    const room = data.room;
     const chat = chats.find(item => item.id === room);
+
     if (!chat) return;
 
-    const messageText = data.message || data.text || "";
-    const id = data.id ?? `${room}-${data.created_at}-${messageText}-${data.username}`;
-    if (seenMessages.has(String(id))) return;
-    seenMessages.add(String(id));
+    const id = String(data.id);
+    if (seenMessages.has(id)) return;
+
+    seenMessages.add(id);
 
     chat.messages.push({
-      text: messageText,
+      id,
+      text: data.message || "",
+      username: data.username || "",
       mine: data.username === currentUser?.username,
       time: data.created_at ? getTime(data.created_at) : getTime()
     });
 
-    chat.time = getTime();
+    chat.time = getTime(data.created_at);
     if (selectedChatId !== chat.id) chat.unread++;
-    render();
+
+    if (selectedChatId === chat.id) {
+      renderConversation();
+    } else {
+      renderMainPage();
+    }
   });
 }
 
 function renderChatList() {
   const filtered = chats.filter(chat => {
     const matchesSearch = chat.name.toLowerCase().includes(searchText.toLowerCase());
-    const matchesFilter = activeFilter === "all" ||
+
+    const matchesFilter =
+      activeFilter === "all" ||
       (activeFilter === "groups" && chat.group) ||
       (activeFilter === "private" && !chat.group);
+
     return matchesSearch && matchesFilter;
   });
 
   if (!filtered.length) {
-    return `<div class="empty-state"><div class="empty-icon">🔎</div><h3>گفتگویی پیدا نشد</h3><p>عبارت دیگری را جستجو کن.</p></div>`;
+    return `
+      <div class="empty-state">
+        <div class="empty-icon">💬</div>
+        <h3>هنوز گفتگویی نداری</h3>
+        <p>با دکمه گفتگوی جدید شروع کن.</p>
+      </div>
+    `;
   }
 
   return filtered.map(chat => {
     const last = chat.messages.at(-1);
+
     return `
       <button class="chat-item" data-chat-id="${escapeHTML(chat.id)}">
         <div class="avatar ${chat.color}">${chat.avatar}</div>
@@ -288,32 +382,44 @@ function renderChatList() {
 }
 
 function renderMainPage() {
-  const title = activeTab === "chats" ? "گفتگوها" : activeTab === "contacts" ? "مخاطبین" : "حساب کاربری";
-
   let content = "";
 
   if (activeTab === "chats") {
     content = `
       <div class="section-heading">
-        <div><h2>گفتگوها</h2><p>پیام‌هایت را اینجا ببین</p></div>
+        <div>
+          <h2>گفتگوها</h2>
+          <p>گفتگوهای واقعی حساب تو</p>
+        </div>
+        <button class="new-chat-button" id="new-chat-button">+ گفتگوی جدید</button>
       </div>
+
       <div class="search-box">
         <span>⌕</span>
         <input id="chat-search" placeholder="جستجوی گفتگو..." value="${escapeHTML(searchText)}" />
       </div>
+
       <div class="filters">
         <button class="filter-button ${activeFilter === "all" ? "active" : ""}" data-filter="all">همه</button>
         <button class="filter-button ${activeFilter === "private" ? "active" : ""}" data-filter="private">شخصی</button>
         <button class="filter-button ${activeFilter === "groups" ? "active" : ""}" data-filter="groups">گروه‌ها</button>
       </div>
+
       <div class="chat-list">${renderChatList()}</div>
     `;
   } else if (activeTab === "contacts") {
     content = `
       <div class="simple-page">
         <div class="simple-icon">👥</div>
-        <h2>مخاطبین</h2>
-        <p>بخش مخاطبین در مرحله بعدی تکمیل می‌شود.</p>
+        <h2>جستجوی کاربران</h2>
+        <p>نام کاربری مخاطب را جستجو کن.</p>
+
+        <form id="user-search-form">
+          <input name="username" placeholder="نام کاربری..." minlength="3" required />
+          <button class="new-chat-button" type="submit">جستجو</button>
+        </form>
+
+        <div id="user-results"></div>
       </div>
     `;
   } else {
@@ -334,9 +440,13 @@ function renderMainPage() {
           <div class="brand-logo">گ</div>
           <div><h1>گپ‌یار</h1><span>پیام‌رسان شما</span></div>
         </div>
-        <div class="connection-status offline"><span class="status-dot"></span>در حال اتصال</div>
+        <div class="connection-status offline">
+          <span class="status-dot"></span>در حال اتصال
+        </div>
       </header>
+
       <main class="main-content">${content}</main>
+
       <nav class="bottom-nav">
         <button class="nav-item ${activeTab === "chats" ? "active" : ""}" data-tab="chats"><span>💬</span>گفتگوها</button>
         <button class="nav-item ${activeTab === "contacts" ? "active" : ""}" data-tab="contacts"><span>👥</span>مخاطبین</button>
@@ -350,6 +460,7 @@ function renderMainPage() {
 
 function renderConversation() {
   const chat = selectedChat();
+
   if (!chat) {
     selectedChatId = null;
     renderMainPage();
@@ -365,13 +476,16 @@ function renderConversation() {
           <strong>${escapeHTML(chat.name)}</strong>
           <span>${chat.group ? "گروه گپ‌یار" : "گفتگوی گپ‌یار"}</span>
         </div>
+        <button class="icon-button" id="add-member-button" title="افزودن عضو">+</button>
       </header>
 
       <main class="messages" id="messages">
         <div class="date-divider"><span>گفتگو</span></div>
+
         ${chat.messages.map(message => `
           <div class="message-row ${message.mine ? "mine" : "theirs"}">
             <div class="message-bubble">
+              ${!message.mine && chat.group ? `<small>${escapeHTML(message.username)}</small>` : ""}
               <div class="message-text">${escapeHTML(message.text)}</div>
               <span class="message-time">${escapeHTML(message.time)}</span>
             </div>
@@ -383,6 +497,7 @@ function renderConversation() {
         <input name="message" placeholder="پیامت را بنویس..." autocomplete="off" maxlength="2000" required />
         <button class="send-button" type="submit">➤</button>
       </form>
+
       <p class="demo-note">گپ‌یار — پیام‌ها از طریق سرور ارسال می‌شوند.</p>
     </div>
   `;
@@ -401,8 +516,130 @@ function render() {
   else renderMainPage();
 }
 
+async function createConversation() {
+  const title = prompt("عنوان گفتگو را وارد کن:");
+  if (!title?.trim()) return;
+
+  try {
+    const data = await api("/api/conversations", {
+      method: "POST",
+      body: JSON.stringify({
+        title: title.trim(),
+        isGroup: false
+      })
+    });
+
+    const item = data.conversation;
+
+    chats.unshift({
+      id: item.id,
+      name: item.title,
+      avatar: "👤",
+      color: "purple",
+      time: getTime(),
+      unread: 0,
+      group: false,
+      messages: []
+    });
+
+    selectedChatId = item.id;
+    render();
+    joinSelectedRoom();
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
+async function searchUsers(username) {
+  const data = await api(
+    `/api/users/search?q=${encodeURIComponent(username)}`
+  );
+
+  const results = document.querySelector("#user-results");
+  if (!results) return;
+
+  if (!data.users?.length) {
+    results.innerHTML = "<p>کاربری پیدا نشد.</p>";
+    return;
+  }
+
+  results.innerHTML = data.users.map(user => `
+    <div class="contact-result">
+      <strong>${escapeHTML(user.username)}</strong>
+      <button class="new-chat-button" data-start-chat="${escapeHTML(user.username)}">
+        شروع گفتگو
+      </button>
+    </div>
+  `).join("");
+}
+
+async function startPrivateChat(username) {
+  if (busy) return;
+
+  busy = true;
+
+  try {
+    // ابتدا گفتگوی جدید ایجاد می‌شود.
+    const data = await api("/api/conversations", {
+      method: "POST",
+      body: JSON.stringify({
+        title: username,
+        isGroup: false
+      })
+    });
+
+    const conversation = data.conversation;
+
+    // کاربر موردنظر به گفتگو اضافه می‌شود.
+    await api(`/api/conversations/${encodeURIComponent(conversation.id)}/members`, {
+      method: "POST",
+      body: JSON.stringify({ username })
+    });
+
+    chats.unshift({
+      id: conversation.id,
+      name: username,
+      avatar: "👤",
+      color: "purple",
+      time: getTime(),
+      unread: 0,
+      group: false,
+      messages: []
+    });
+
+    selectedChatId = conversation.id;
+    activeTab = "chats";
+    render();
+    joinSelectedRoom();
+  } catch (error) {
+    alert(error.message);
+  } finally {
+    busy = false;
+  }
+}
+
+async function addMember() {
+  const chat = selectedChat();
+  if (!chat) return;
+
+  const username = prompt("نام کاربری عضو جدید را وارد کن:");
+  if (!username?.trim()) return;
+
+  try {
+    await api(`/api/conversations/${encodeURIComponent(chat.id)}/members`, {
+      method: "POST",
+      body: JSON.stringify({ username: username.trim() })
+    });
+
+    alert("عضو با موفقیت اضافه شد.");
+  } catch (error) {
+    alert(error.message);
+  }
+}
+
 app.addEventListener("click", async event => {
   const authTab = event.target.closest("[data-auth-mode]");
+
   if (authTab) {
     authMode = authTab.dataset.authMode;
     authMessage = "";
@@ -411,16 +648,23 @@ app.addEventListener("click", async event => {
   }
 
   const chatButton = event.target.closest("[data-chat-id]");
+
   if (chatButton) {
+    const oldRoom = selectedChatId;
     selectedChatId = chatButton.dataset.chatId;
+
     const chat = selectedChat();
     if (chat) chat.unread = 0;
+
+    if (oldRoom && socket?.connected) socket.emit("leave-room", oldRoom);
+
     render();
     joinSelectedRoom();
     return;
   }
 
   const filterButton = event.target.closest("[data-filter]");
+
   if (filterButton) {
     activeFilter = filterButton.dataset.filter;
     render();
@@ -428,16 +672,42 @@ app.addEventListener("click", async event => {
   }
 
   const tabButton = event.target.closest("[data-tab]");
+
   if (tabButton) {
-    activeTab = tabButton.dataset.tab;
+    if (selectedChatId && socket?.connected) {
+      socket.emit("leave-room", selectedChatId);
+    }
+
     selectedChatId = null;
+    activeTab = tabButton.dataset.tab;
     render();
     return;
   }
 
   if (event.target.closest("#back-button")) {
+    if (selectedChatId && socket?.connected) {
+      socket.emit("leave-room", selectedChatId);
+    }
+
     selectedChatId = null;
     render();
+    return;
+  }
+
+  if (event.target.closest("#new-chat-button")) {
+    await createConversation();
+    return;
+  }
+
+  if (event.target.closest("#add-member-button")) {
+    await addMember();
+    return;
+  }
+
+  const startButton = event.target.closest("[data-start-chat]");
+
+  if (startButton) {
+    await startPrivateChat(startButton.dataset.startChat);
     return;
   }
 
@@ -451,6 +721,7 @@ app.addEventListener("input", event => {
     const position = event.target.selectionStart;
     searchText = event.target.value;
     render();
+
     const input = document.querySelector("#chat-search");
     input?.focus();
     input?.setSelectionRange(position, position);
@@ -464,6 +735,20 @@ app.addEventListener("submit", async event => {
     return;
   }
 
+  if (event.target.id === "user-search-form") {
+    event.preventDefault();
+
+    const username = event.target.elements.username.value.trim();
+
+    try {
+      await searchUsers(username);
+    } catch (error) {
+      alert(error.message);
+    }
+
+    return;
+  }
+
   if (event.target.id === "message-form") {
     event.preventDefault();
 
@@ -471,31 +756,35 @@ app.addEventListener("submit", async event => {
     const message = input.value.trim();
     const chat = selectedChat();
 
-    if (!message || !chat || !socket?.connected) return;
+    if (!message || !chat) return;
+
+    if (!socket?.connected) {
+      alert("اتصال به سرور برقرار نیست.");
+      return;
+    }
 
     socket.emit("send-message", {
       room: chat.id,
       message
     });
 
-    chat.messages.push({
-      text: message,
-      mine: true,
-      time: getTime()
-    });
-    chat.time = getTime();
-    render();
+    input.value = "";
   }
 });
 
 async function startApp() {
-  render();
-  connectSocket();
+  try {
+    await loadConversations();
+    connectSocket();
+  } catch (error) {
+    console.error(error);
+    alert("دریافت گفتگوها انجام نشد: " + error.message);
+  }
 }
 
 async function init() {
   if (await checkSession()) {
-    startApp();
+    await startApp();
   } else {
     showAuth();
   }
