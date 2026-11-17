@@ -3,155 +3,274 @@ import "./style.css";
 import { io } from "socket.io-client";
 
 const SERVER_URL = "https://gapyar-server.onrender.com";
+const TOKEN_KEY = "gapyar_token";
+
 const app = document.querySelector("#app");
-
-const socket = io(SERVER_URL, {
-  autoConnect: true,
-  reconnection: true,
-  timeout: 20000
-});
-
-const chats = [
-  { id: "amir", name: "امیر", avatar: "👨🏻", color: "purple", group: false, messages: [], unread: 0, time: "" },
-  { id: "programming", name: "گروه برنامه‌نویسی", avatar: "💻", color: "blue", group: true, messages: [], unread: 0, time: "" },
-  { id: "mohammad", name: "محمد", avatar: "🧑🏻", color: "green", group: false, messages: [], unread: 0, time: "" },
-  { id: "sara", name: "سارا", avatar: "👩🏻", color: "pink", group: false, messages: [], unread: 0, time: "" },
-  { id: "friends", name: "گروه دوستان", avatar: "👥", color: "orange", group: true, messages: [], unread: 0, time: "" }
-];
+let token = localStorage.getItem(TOKEN_KEY);
+let currentUser = null;
+let authMode = "login";
+let authMessage = "";
+let authLoading = false;
 
 let selectedChatId = null;
 let activeTab = "chats";
 let activeFilter = "all";
 let searchText = "";
+let socket = null;
 
-const loadedRooms = new Set();
-const loadingRooms = new Set();
-const receivedMessageIds = new Set();
+const chats = [
+  { id: "amir", name: "امیر", avatar: "👨🏻", color: "purple", time: "۱۲:۴۵", unread: 2, group: false, messages: [] },
+  { id: "programming", name: "گروه برنامه‌نویسی", avatar: "💻", color: "blue", time: "دیروز", unread: 0, group: true, messages: [] },
+  { id: "mohammad", name: "محمد", avatar: "🧑🏻", color: "green", time: "دیروز", unread: 0, group: false, messages: [] },
+  { id: "sara", name: "سارا", avatar: "👩🏻", color: "pink", time: "دوشنبه", unread: 0, group: false, messages: [] },
+  { id: "friends", name: "گروه دوستان", avatar: "👥", color: "orange", time: "یکشنبه", unread: 0, group: true, messages: [] }
+];
 
-function escapeHTML(value) {
+const seenMessages = new Set();
+
+function escapeHTML(value = "") {
   return String(value).replace(/[&<>"']/g, char => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;",
-    '"': "&quot;", "'": "&#039;"
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
   })[char]);
 }
 
-function selectedChat() {
-  return chats.find(chat => chat.id === selectedChatId);
-}
-
-function currentTime() {
-  return new Date().toLocaleTimeString("fa-IR", {
-    hour: "2-digit",
-    minute: "2-digit"
-  });
-}
-
-function formatTime(value) {
-  if (!value) return currentTime();
-
+function getTime(value = new Date()) {
   return new Date(value).toLocaleTimeString("fa-IR", {
     hour: "2-digit",
     minute: "2-digit"
   });
 }
 
-function updateConnectionStatus(online) {
-  const element = document.querySelector("#connection-status");
-  if (!element) return;
+function selectedChat() {
+  return chats.find(chat => chat.id === selectedChatId);
+}
 
-  element.classList.toggle("online", online);
-  element.classList.toggle("offline", !online);
-  element.innerHTML = `
-    <span class="status-dot"></span>
-    ${online ? "سرور متصل است" : "سرور قطع است"}
+function showAuth() {
+  if (socket) {
+    socket.disconnect();
+    socket = null;
+  }
+
+  app.innerHTML = `
+    <main class="auth-page" dir="rtl">
+      <div class="auth-card">
+        <div class="auth-logo">گ</div>
+        <h1>گپ‌یار</h1>
+        <p class="auth-subtitle">پیام‌رسان ساده و سریع شما</p>
+
+        <div class="auth-tabs">
+          <button type="button" class="${authMode === "login" ? "active" : ""}" data-auth-mode="login">ورود</button>
+          <button type="button" class="${authMode === "register" ? "active" : ""}" data-auth-mode="register">ثبت‌نام</button>
+        </div>
+
+        <form id="auth-form">
+          <label for="auth-username">نام کاربری</label>
+          <input id="auth-username" name="username" type="text"
+            placeholder="مثلاً amir123" minlength="3" maxlength="20"
+            pattern="[a-zA-Z0-9_]+" autocomplete="username" required />
+
+          <label for="auth-password">رمز عبور</label>
+          <input id="auth-password" name="password" type="password"
+            placeholder="حداقل ۸ کاراکتر" minlength="8"
+            autocomplete="${authMode === "login" ? "current-password" : "new-password"}" required />
+
+          <p class="auth-message" id="auth-message">${escapeHTML(authMessage)}</p>
+          <button class="auth-submit" type="submit" ${authLoading ? "disabled" : ""}>
+            ${authLoading ? "لطفاً صبر کن..." : authMode === "login" ? "ورود به حساب" : "ساخت حساب"}
+          </button>
+        </form>
+
+        <p class="auth-hint">نام کاربری فقط شامل حروف انگلیسی، عدد و _ باشد.</p>
+      </div>
+    </main>
   `;
 }
 
-async function loadHistory(chat) {
-  if (!chat || loadedRooms.has(chat.id) || loadingRooms.has(chat.id)) return;
+async function authRequest(endpoint, username, password) {
+  const response = await fetch(`${SERVER_URL}/api/auth/${endpoint}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password })
+  });
 
-  loadingRooms.add(chat.id);
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    throw new Error(data.message || data.error || "اطلاعات واردشده درست نیست.");
+  }
+
+  return data;
+}
+
+async function handleAuthSubmit(form) {
+  if (authLoading) return;
+
+  const username = form.username.value.trim().toLowerCase();
+  const password = form.password.value;
+
+  authLoading = true;
+  authMessage = "";
+  showAuth();
 
   try {
-    const response = await fetch(
-      `${SERVER_URL}/api/messages/${encodeURIComponent(chat.id)}`
+    const result = await authRequest(
+      authMode === "login" ? "login" : "register",
+      username,
+      password
     );
 
-    if (!response.ok) {
-      throw new Error("دریافت تاریخچه ناموفق بود");
-    }
+    if (!result.token) throw new Error("پاسخ سرور معتبر نیست.");
 
-    const history = await response.json();
+    token = result.token;
+    localStorage.setItem(TOKEN_KEY, token);
+    currentUser = result.user || { username };
+    authMessage = "";
+    authLoading = false;
+    startApp();
+  } catch (error) {
+    authLoading = false;
+    authMessage = error.message || "ارتباط با سرور برقرار نشد.";
+    showAuth();
+  }
+}
 
-    if (!Array.isArray(history)) {
-      throw new Error("پاسخ سرور نامعتبر است");
-    }
+async function checkSession() {
+  if (!token) return false;
 
-    chat.messages = history.map(item => {
-      if (item.id) receivedMessageIds.add(String(item.id));
-
-      return {
-        id: item.id,
-        text: item.message,
-        mine: false,
-        time: formatTime(item.created_at)
-      };
+  try {
+    const response = await fetch(`${SERVER_URL}/api/auth/me`, {
+      headers: { Authorization: `Bearer ${token}` }
     });
 
-    const last = chat.messages.at(-1);
-    if (last) chat.time = last.time;
+    if (!response.ok) throw new Error("نشست نامعتبر است");
 
-    loadedRooms.add(chat.id);
+    const data = await response.json();
+    currentUser = data.user || data;
+    return true;
+  } catch {
+    token = null;
+    currentUser = null;
+    localStorage.removeItem(TOKEN_KEY);
+    return false;
+  }
+}
 
-    if (selectedChatId === chat.id) render();
-    else renderChatList();
+async function logout() {
+  try {
+    await fetch(`${SERVER_URL}/api/auth/logout`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` }
+    });
+  } catch {
+    // خروج محلی حتی در صورت قطع بودن سرور انجام می‌شود.
+  }
 
+  token = null;
+  currentUser = null;
+  localStorage.removeItem(TOKEN_KEY);
+  selectedChatId = null;
+  showAuth();
+}
+
+function updateConnectionStatus(online) {
+  const status = document.querySelector(".connection-status");
+  if (!status) return;
+
+  status.className = `connection-status ${online ? "online" : "offline"}`;
+  status.innerHTML = `<span class="status-dot"></span>${online ? "متصل" : "قطع اتصال"}`;
+}
+
+async function loadHistory(chat) {
+  try {
+    const response = await fetch(`${SERVER_URL}/api/messages/${encodeURIComponent(chat.id)}`);
+    if (!response.ok) return;
+
+    const data = await response.json();
+    const messages = Array.isArray(data) ? data : (data.messages || []);
+
+    messages.forEach(item => {
+      const id = item.id ?? `${chat.id}-${item.created_at}-${item.message}`;
+      if (seenMessages.has(String(id))) return;
+      seenMessages.add(String(id));
+
+      chat.messages.push({
+        text: item.message || item.text || "",
+        mine: item.username === currentUser?.username,
+        time: item.created_at ? getTime(item.created_at) : getTime()
+      });
+    });
+
+    render();
   } catch (error) {
     console.error("History error:", error);
-    alert("دریافت پیام‌های قبلی انجام نشد. دوباره تلاش کن.");
-  } finally {
-    loadingRooms.delete(chat.id);
   }
 }
 
 function joinSelectedRoom() {
   const chat = selectedChat();
+  if (!chat || !socket?.connected) return;
 
-  if (chat && socket.connected) {
-    socket.emit("join-room", chat.id);
-    loadHistory(chat);
-  }
+  socket.emit("join-room", chat.id);
+  loadHistory(chat);
+}
+
+function connectSocket() {
+  if (socket) socket.disconnect();
+
+  socket = io(SERVER_URL, {
+    autoConnect: true,
+    reconnection: true,
+    reconnectionAttempts: 10,
+    timeout: 20000
+  });
+
+  socket.on("connect", () => {
+    updateConnectionStatus(true);
+    joinSelectedRoom();
+  });
+
+  socket.on("disconnect", () => updateConnectionStatus(false));
+  socket.on("connect_error", () => updateConnectionStatus(false));
+
+  socket.on("new-message", data => {
+    const room = data.room || data.chatId;
+    const chat = chats.find(item => item.id === room);
+    if (!chat) return;
+
+    const messageText = data.message || data.text || "";
+    const id = data.id ?? `${room}-${data.created_at}-${messageText}-${data.username}`;
+    if (seenMessages.has(String(id))) return;
+    seenMessages.add(String(id));
+
+    chat.messages.push({
+      text: messageText,
+      mine: data.username === currentUser?.username,
+      time: data.created_at ? getTime(data.created_at) : getTime()
+    });
+
+    chat.time = getTime();
+    if (selectedChatId !== chat.id) chat.unread++;
+    render();
+  });
 }
 
 function renderChatList() {
-  const list = document.querySelector("#chat-list");
-  if (!list) return;
-
   const filtered = chats.filter(chat => {
-    const search = chat.name.toLowerCase().includes(searchText.toLowerCase());
-
-    const filter =
-      activeFilter === "all" ||
-      (activeFilter === "unread" && chat.unread > 0) ||
-      (activeFilter === "groups" && chat.group);
-
-    return search && filter;
+    const matchesSearch = chat.name.toLowerCase().includes(searchText.toLowerCase());
+    const matchesFilter = activeFilter === "all" ||
+      (activeFilter === "groups" && chat.group) ||
+      (activeFilter === "private" && !chat.group);
+    return matchesSearch && matchesFilter;
   });
 
   if (!filtered.length) {
-    list.innerHTML = `
-      <div class="empty-state">
-        <div class="empty-icon">🔎</div>
-        <h3>گفتگویی پیدا نشد</h3>
-      </div>`;
-    return;
+    return `<div class="empty-state"><div class="empty-icon">🔎</div><h3>گفتگویی پیدا نشد</h3><p>عبارت دیگری را جستجو کن.</p></div>`;
   }
 
-  list.innerHTML = filtered.map(chat => {
+  return filtered.map(chat => {
     const last = chat.messages.at(-1);
-
     return `
-      <button class="chat-item" type="button" data-chat-id="${escapeHTML(chat.id)}">
+      <button class="chat-item" data-chat-id="${escapeHTML(chat.id)}">
         <div class="avatar ${chat.color}">${chat.avatar}</div>
         <div class="chat-info">
           <div class="chat-title-row">
@@ -159,212 +278,149 @@ function renderChatList() {
             <span class="chat-time">${escapeHTML(chat.time)}</span>
           </div>
           <div class="chat-bottom-row">
-            <span class="last-message">
-              ${last ? escapeHTML(last.text) : "هنوز پیامی وجود ندارد"}
-            </span>
+            <span class="last-message">${escapeHTML(last?.text || "هنوز پیامی ارسال نشده")}</span>
             ${chat.unread ? `<span class="unread-count">${chat.unread}</span>` : ""}
           </div>
         </div>
-      </button>`;
+      </button>
+    `;
   }).join("");
 }
 
-function renderConversation(chat) {
-  const messages = chat.messages.map(message => `
-    <div class="message-row ${message.mine ? "mine" : "theirs"}">
-      <div class="message-bubble">
-        <div class="message-text">${escapeHTML(message.text)}</div>
-        <span class="message-time">${escapeHTML(message.time)}</span>
-      </div>
-    </div>
-  `).join("");
+function renderMainPage() {
+  const title = activeTab === "chats" ? "گفتگوها" : activeTab === "contacts" ? "مخاطبین" : "حساب کاربری";
 
-  return `
-    <section class="conversation">
+  let content = "";
+
+  if (activeTab === "chats") {
+    content = `
+      <div class="section-heading">
+        <div><h2>گفتگوها</h2><p>پیام‌هایت را اینجا ببین</p></div>
+      </div>
+      <div class="search-box">
+        <span>⌕</span>
+        <input id="chat-search" placeholder="جستجوی گفتگو..." value="${escapeHTML(searchText)}" />
+      </div>
+      <div class="filters">
+        <button class="filter-button ${activeFilter === "all" ? "active" : ""}" data-filter="all">همه</button>
+        <button class="filter-button ${activeFilter === "private" ? "active" : ""}" data-filter="private">شخصی</button>
+        <button class="filter-button ${activeFilter === "groups" ? "active" : ""}" data-filter="groups">گروه‌ها</button>
+      </div>
+      <div class="chat-list">${renderChatList()}</div>
+    `;
+  } else if (activeTab === "contacts") {
+    content = `
+      <div class="simple-page">
+        <div class="simple-icon">👥</div>
+        <h2>مخاطبین</h2>
+        <p>بخش مخاطبین در مرحله بعدی تکمیل می‌شود.</p>
+      </div>
+    `;
+  } else {
+    content = `
+      <div class="simple-page">
+        <div class="simple-icon">👤</div>
+        <h2>حساب کاربری</h2>
+        <p>نام کاربری: <strong>${escapeHTML(currentUser?.username || "کاربر")}</strong></p>
+        <button class="new-chat-button" id="logout-button">خروج از حساب</button>
+      </div>
+    `;
+  }
+
+  app.innerHTML = `
+    <div class="app-shell" dir="rtl">
+      <header class="top-header">
+        <div class="brand">
+          <div class="brand-logo">گ</div>
+          <div><h1>گپ‌یار</h1><span>پیام‌رسان شما</span></div>
+        </div>
+        <div class="connection-status offline"><span class="status-dot"></span>در حال اتصال</div>
+      </header>
+      <main class="main-content">${content}</main>
+      <nav class="bottom-nav">
+        <button class="nav-item ${activeTab === "chats" ? "active" : ""}" data-tab="chats"><span>💬</span>گفتگوها</button>
+        <button class="nav-item ${activeTab === "contacts" ? "active" : ""}" data-tab="contacts"><span>👥</span>مخاطبین</button>
+        <button class="nav-item ${activeTab === "profile" ? "active" : ""}" data-tab="profile"><span>👤</span>حساب من</button>
+      </nav>
+    </div>
+  `;
+
+  updateConnectionStatus(Boolean(socket?.connected));
+}
+
+function renderConversation() {
+  const chat = selectedChat();
+  if (!chat) {
+    selectedChatId = null;
+    renderMainPage();
+    return;
+  }
+
+  app.innerHTML = `
+    <div class="conversation" dir="rtl">
       <header class="conversation-header">
-        <button class="icon-button" data-action="back">➜</button>
+        <button class="icon-button" id="back-button">›</button>
         <div class="avatar small ${chat.color}">${chat.avatar}</div>
         <div class="conversation-user">
           <strong>${escapeHTML(chat.name)}</strong>
-          <span>${socket.connected ? "آنلاین" : "در حال اتصال..."}</span>
+          <span>${chat.group ? "گروه گپ‌یار" : "گفتگوی گپ‌یار"}</span>
         </div>
       </header>
 
-      <div class="messages" id="messages">
-        <div class="date-divider"><span>تاریخچه پیام‌ها</span></div>
-        ${messages}
-      </div>
+      <main class="messages" id="messages">
+        <div class="date-divider"><span>گفتگو</span></div>
+        ${chat.messages.map(message => `
+          <div class="message-row ${message.mine ? "mine" : "theirs"}">
+            <div class="message-bubble">
+              <div class="message-text">${escapeHTML(message.text)}</div>
+              <span class="message-time">${escapeHTML(message.time)}</span>
+            </div>
+          </div>
+        `).join("")}
+      </main>
 
       <form class="message-form" id="message-form">
-        <input id="message-input" type="text"
-          maxlength="2000" placeholder="پیامت را بنویس..."
-          autocomplete="off" required />
+        <input name="message" placeholder="پیامت را بنویس..." autocomplete="off" maxlength="2000" required />
         <button class="send-button" type="submit">➤</button>
       </form>
-    </section>`;
-}
+      <p class="demo-note">گپ‌یار — پیام‌ها از طریق سرور ارسال می‌شوند.</p>
+    </div>
+  `;
 
-function renderMainPage() {
-  return `
-    <div class="app-shell">
-      <header class="top-header">
-        <div class="brand">
-          <div class="brand-logo">گ</div>
-          <div><h1>گپ‌یار</h1><span>با هم در ارتباط باشیم</span></div>
-        </div>
-        <div class="connection-status" id="connection-status">
-          <span class="status-dot"></span> در حال اتصال...
-        </div>
-      </header>
-
-      <main class="main-content">
-        <div class="section-heading">
-          <div><h2>گفتگوها</h2><p>پیام‌های دوستانت اینجا هستند</p></div>
-          <button class="new-chat-button" data-action="new-chat">＋ گفتگوی جدید</button>
-        </div>
-
-        <div class="search-box">
-          <span>⌕</span>
-          <input id="search-input" type="search" placeholder="جستجوی گفتگو..." />
-        </div>
-
-        <div class="filters">
-          <button class="filter-button ${activeFilter === "all" ? "active" : ""}" data-filter="all">همه</button>
-          <button class="filter-button ${activeFilter === "unread" ? "active" : ""}" data-filter="unread">خوانده‌نشده</button>
-          <button class="filter-button ${activeFilter === "groups" ? "active" : ""}" data-filter="groups">گروه‌ها</button>
-        </div>
-
-        <div class="chat-list" id="chat-list"></div>
-      </main>
-
-      <nav class="bottom-nav">
-        <button class="nav-item ${activeTab === "chats" ? "active" : ""}" data-tab="chats"><span>▤</span> گفتگوها</button>
-        <button class="nav-item ${activeTab === "contacts" ? "active" : ""}" data-tab="contacts"><span>♙</span> مخاطبین</button>
-        <button class="nav-item ${activeTab === "profile" ? "active" : ""}" data-tab="profile"><span>⚙</span> پروفایل</button>
-      </nav>
-    </div>`;
-}
-
-function renderSimplePage(title, description, icon) {
-  return `
-    <div class="app-shell">
-      <header class="top-header">
-        <div class="brand">
-          <div class="brand-logo">گ</div>
-          <div><h1>گپ‌یار</h1><span>با هم در ارتباط باشیم</span></div>
-        </div>
-        <div class="connection-status" id="connection-status">
-          <span class="status-dot"></span> در حال اتصال...
-        </div>
-      </header>
-      <main class="simple-page">
-        <div class="simple-icon">${icon}</div>
-        <h2>${title}</h2>
-        <p>${description}</p>
-        <button class="new-chat-button" data-tab="chats">بازگشت به گفتگوها</button>
-      </main>
-      <nav class="bottom-nav">
-        <button class="nav-item ${activeTab === "chats" ? "active" : ""}" data-tab="chats">▤ گفتگوها</button>
-        <button class="nav-item ${activeTab === "contacts" ? "active" : ""}" data-tab="contacts">♙ مخاطبین</button>
-        <button class="nav-item ${activeTab === "profile" ? "active" : ""}" data-tab="profile">⚙ پروفایل</button>
-      </nav>
-    </div>`;
+  const messages = document.querySelector("#messages");
+  messages.scrollTop = messages.scrollHeight;
 }
 
 function render() {
-  if (selectedChatId) {
-    const chat = selectedChat();
-
-    if (chat) {
-      chat.unread = 0;
-      app.innerHTML = renderConversation(chat);
-
-      const messages = document.querySelector("#messages");
-      if (messages) messages.scrollTop = messages.scrollHeight;
-
-      return;
-    }
-
-    selectedChatId = null;
-  }
-
-  if (activeTab === "contacts") {
-    app.innerHTML = renderSimplePage("مخاطبین", "بخش مخاطبین بعداً تکمیل می‌شود.", "♙");
-    updateConnectionStatus(socket.connected);
+  if (!token || !currentUser) {
+    showAuth();
     return;
   }
 
-  if (activeTab === "profile") {
-    app.innerHTML = renderSimplePage("پروفایل", "تنظیمات حساب کاربری بعداً اضافه می‌شود.", "⚙");
-    updateConnectionStatus(socket.connected);
-    return;
-  }
-
-  app.innerHTML = renderMainPage();
-  renderChatList();
-
-  const input = document.querySelector("#search-input");
-  if (input) input.value = searchText;
-
-  updateConnectionStatus(socket.connected);
+  if (selectedChatId) renderConversation();
+  else renderMainPage();
 }
 
-socket.on("connect", () => {
-  updateConnectionStatus(true);
-  joinSelectedRoom();
-});
-
-socket.on("disconnect", () => {
-  updateConnectionStatus(false);
-});
-
-socket.on("connect_error", error => {
-  console.error("Socket error:", error.message);
-  updateConnectionStatus(false);
-});
-
-socket.on("new-message", data => {
-  if (
-    !data ||
-    typeof data.room !== "string" ||
-    typeof data.message !== "string"
-  ) return;
-
-  const chat = chats.find(item => item.id === data.room);
-  if (!chat) return;
-
-  if (data.id && receivedMessageIds.has(String(data.id))) return;
-  if (data.id) receivedMessageIds.add(String(data.id));
-
-  chat.messages.push({
-    id: data.id,
-    text: data.message,
-    mine: false,
-    time: formatTime(data.created_at || data.time)
-  });
-
-  chat.time = currentTime();
-
-  if (selectedChatId === chat.id) {
-    render();
-  } else {
-    chat.unread++;
-    renderChatList();
+app.addEventListener("click", async event => {
+  const authTab = event.target.closest("[data-auth-mode]");
+  if (authTab) {
+    authMode = authTab.dataset.authMode;
+    authMessage = "";
+    showAuth();
+    return;
   }
-});
 
-app.addEventListener("click", event => {
   const chatButton = event.target.closest("[data-chat-id]");
-
   if (chatButton) {
     selectedChatId = chatButton.dataset.chatId;
+    const chat = selectedChat();
+    if (chat) chat.unread = 0;
     render();
     joinSelectedRoom();
     return;
   }
 
   const filterButton = event.target.closest("[data-filter]");
-
   if (filterButton) {
     activeFilter = filterButton.dataset.filter;
     render();
@@ -372,58 +428,77 @@ app.addEventListener("click", event => {
   }
 
   const tabButton = event.target.closest("[data-tab]");
-
   if (tabButton) {
     activeTab = tabButton.dataset.tab;
     selectedChatId = null;
-    searchText = "";
     render();
     return;
   }
 
-  const actionButton = event.target.closest("[data-action]");
-
-  if (!actionButton) return;
-
-  if (actionButton.dataset.action === "back") {
+  if (event.target.closest("#back-button")) {
     selectedChatId = null;
     render();
+    return;
   }
 
-  if (actionButton.dataset.action === "new-chat") {
-    alert("ساخت گفتگوی جدید در مراحل بعدی اضافه می‌شود.");
+  if (event.target.closest("#logout-button")) {
+    await logout();
   }
 });
 
 app.addEventListener("input", event => {
-  if (event.target.id === "search-input") {
+  if (event.target.id === "chat-search") {
+    const position = event.target.selectionStart;
     searchText = event.target.value;
-    renderChatList();
+    render();
+    const input = document.querySelector("#chat-search");
+    input?.focus();
+    input?.setSelectionRange(position, position);
   }
 });
 
-app.addEventListener("submit", event => {
-  if (event.target.id !== "message-form") return;
-
-  event.preventDefault();
-
-  const input = document.querySelector("#message-input");
-  const message = input.value.trim();
-  const chat = selectedChat();
-
-  if (!chat || !message) return;
-
-  if (!socket.connected) {
-    alert("اتصال به سرور برقرار نیست.");
+app.addEventListener("submit", async event => {
+  if (event.target.id === "auth-form") {
+    event.preventDefault();
+    await handleAuthSubmit(event.target);
     return;
   }
 
-  socket.emit("send-message", {
-    room: chat.id,
-    message
-  });
+  if (event.target.id === "message-form") {
+    event.preventDefault();
 
-  input.value = "";
+    const input = event.target.elements.message;
+    const message = input.value.trim();
+    const chat = selectedChat();
+
+    if (!message || !chat || !socket?.connected) return;
+
+    socket.emit("send-message", {
+      room: chat.id,
+      message
+    });
+
+    chat.messages.push({
+      text: message,
+      mine: true,
+      time: getTime()
+    });
+    chat.time = getTime();
+    render();
+  }
 });
 
-render();
+async function startApp() {
+  render();
+  connectSocket();
+}
+
+async function init() {
+  if (await checkSession()) {
+    startApp();
+  } else {
+    showAuth();
+  }
+}
+
+init();
